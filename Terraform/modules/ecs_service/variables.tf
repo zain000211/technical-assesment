@@ -1,0 +1,10 @@
+variable "service_names" {}
+variable "repository_names" {}
+variable "image_version" {}
+variable "subnets" {}
+variable "ecs_cluster_id" {}
+variable "execution_role_arn" {}
+variable "task_role_arn" {}
+variable "react_tg_arn" {}
+variable "svelte_tg_arn" {}
+variable "rds_endpoint" {}

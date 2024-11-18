@@ -1,0 +1,148 @@
+pipeline {
+    agent any
+    environment {
+        AWS_REGION_1 = 'me-central-1'
+        AWS_REGION_2 = 'us-east-1'
+        ECS_CLUSTER = 'KC-dev-php'
+        ECS_SERVICE = 'php'
+        IMAGE_REPO_1 = '123456789012.dkr.ecr.me-central-1.amazonaws.com/php'
+        IMAGE_REPO_2 = '123456789012.dkr.ecr.us-east-1.amazonaws.com/php'
+        BRANCH_NAME = ''
+    }
+    parameters {
+        string(name: 'BRANCH_NAME', defaultValue: 'main', description: 'Branch name to checkout')
+    }
+    stages {
+        stage('Input Branch Name') {
+            steps {
+                script {
+                    BRANCH_NAME = params.BRANCH_NAME
+                    echo "Branch name provided: ${BRANCH_NAME}"
+                }
+            }
+        }
+        stage('Checkout Code') {
+            steps {
+                echo "Checking out code from branch: ${BRANCH_NAME}"
+                checkout([$class: 'GitSCM',
+                          branches: [[name: "*/${BRANCH_NAME}"]],
+                          userRemoteConfigs: [[url: 'https://your-git-repository-url.git']]
+                ])
+            }
+        }
+        stage('SonarQube Scan') {
+            steps {
+                echo "Running SonarQube scan"
+                withSonarQubeEnv('SonarQube') {
+                    sh 'sonar-scanner -Dsonar.projectKey=php-app -Dsonar.sources=. -Dsonar.branch.name=${BRANCH_NAME}'
+                }
+            }
+        }
+        stage('Build') {
+            steps {
+                echo "Building the PHP application"
+                sh '''
+                # Install Composer dependencies
+                composer install --no-dev --optimize-autoloader
+
+                # Run unit tests if required
+                php artisan test
+                '''
+            }
+        }
+        stage('Dockerize and Push to ECR') {
+            steps {
+                echo "Building Docker image with version: ${BRANCH_NAME}"
+                sh '''
+                aws ecr get-login-password --region ${AWS_REGION_1} | docker login --username AWS --password-stdin ${IMAGE_REPO_1}
+                docker build -t ${IMAGE_REPO_1}:${BRANCH_NAME} .
+                docker push ${IMAGE_REPO_1}:${BRANCH_NAME}
+                '''
+            }
+        }
+        stage('Push to Region_2 ECR') {
+            steps {
+                sh '''
+                aws ecr get-login-password --region ${AWS_REGION_2} | docker login --username AWS --password-stdin ${IMAGE_REPO_2}
+                docker tag ${IMAGE_REPO_1}:${BRANCH_NAME} ${IMAGE_REPO_2}:${BRANCH_NAME}
+                docker push ${IMAGE_REPO_2}:${BRANCH_NAME}
+                '''
+            }
+        }
+        stage('Update ECS Task Definition and Deploy') {
+            parallel {
+                stage('Update and Deploy to Region 1') {
+                    steps {
+                        script {
+                            updateAndDeploy('me-central-1')
+                        }
+                    }
+                }
+                stage('Update and Deploy to Region 2') {
+                    steps {
+                        script {
+                            updateAndDeploy('us-east-1')
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        success {
+            echo "Deployment completed successfully in all regions"
+        }
+        failure {
+            echo "Deployment failed. Initiating rollback."
+            script {
+                rollback()
+            }
+        }
+    }
+}
+
+def updateAndDeploy(region) {
+    stage("Updating ECS Task Definition in ${region}") {
+        echo "Updating ECS Task Definition in ${region} with image version: ${BRANCH_NAME}"
+        def taskDefFile = 'task-def.json'
+        sh """
+        aws ecs describe-task-definition --task-definition ${ECS_SERVICE} --region ${region} > ${taskDefFile}
+        jq '.taskDefinition | .containerDefinitions[0].image = "${IMAGE_REPO_1}:${BRANCH_NAME}"' ${taskDefFile} > new-${taskDefFile}
+        aws ecs register-task-definition --cli-input-json file://new-${taskDefFile} --region ${region}
+        """
+    }
+    stage("Deploying ECS Service in ${region}") {
+        echo "Deploying ECS Service in ${region}"
+        sh """
+        aws ecs update-service --cluster ${ECS_CLUSTER} --service ${ECS_SERVICE} --region ${region} --force-new-deployment
+        """
+    }
+}
+
+def rollback() {
+    stage('Rollback Procedures') {
+        parallel {
+            stage('Rollback Region 1') {
+                steps {
+                    rollbackRegion('me-central-1')
+                }
+            }
+            stage('Rollback Region 2') {
+                steps {
+                    rollbackRegion('us-east-1')
+                }
+            }
+        }
+    }
+}
+
+def rollbackRegion(region) {
+    echo "Rolling back ECS Service in ${region}"
+    def previousTaskDefArn = sh(script: """
+        aws ecs describe-services --services ${ECS_SERVICE} --cluster ${ECS_CLUSTER} --region ${region} --query 'services[0].taskDefinition' --output text
+    """, returnStdout: true).trim()
+    echo "Reverting to previous Task Definition ARN: ${previousTaskDefArn} in ${region}"
+    sh """
+    aws ecs update-service --cluster ${ECS_CLUSTER} --service ${ECS_SERVICE} --region ${region} --task-definition ${previousTaskDefArn} --force-new-deployment
+    """
+}

@@ -1,0 +1,94 @@
+pipeline {
+    agent any
+    
+    environment {
+        DB_HOST = 'database_host'               
+        DB_PORT = '3306'                         
+        DB_NAME = 'kcdb'                
+        LIQUIBASE_IMAGE = 'liquibase/liquibase:latest' 
+    }
+    
+    parameters {
+        string(name: 'BRANCH_NAME', defaultValue: 'main', description: 'Branch name for schema changes')
+        string(name: 'DB_ENV', defaultValue: 'dev', description: 'Database environment (dev, staging, prod)')
+    }
+    
+    stages {
+        stage('Checkout Code') {
+            steps {
+                echo "Checking out code from branch: ${params.BRANCH_NAME}"
+                checkout scm
+            }
+        }
+        
+        stage('Run Database Migrations') {
+            steps {
+                echo "Running database migrations for branch: ${params.BRANCH_NAME}"
+                script {
+                    def dbPassword = credentials('mysql-db-password')
+                    def dbUser = credentials('mysql-db-user')
+                    def dbConnectionString = "jdbc:mysql://${DB_HOST}:${DB_PORT}/${DB_NAME}"
+                    
+                    sh """
+                    docker run --rm \
+                        -v $(pwd)/db-changelog:/liquibase/changelog \
+                        -e LIQUIBASE_URL=${dbConnectionString} \
+                        -e LIQUIBASE_USERNAME=${dbUser} \
+                        -e LIQUIBASE_PASSWORD=${dbPassword} \
+                        ${LIQUIBASE_IMAGE} update
+                    """
+                }
+            }
+        }
+
+        stage('Test Database Schema Changes') {
+            steps {
+                echo "Testing the database schema changes"
+                script {
+                    sh '''
+                    # Example test: Check if a table exists after migration
+                    mysql -h ${DB_HOST} -u ${DB_USER} -p${DB_PASSWORD} -e "USE ${DB_NAME}; SHOW TABLES LIKE 'your_new_table';"
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to DB') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo "Deploying changes to production database"
+                script {
+                    sh """
+                    docker run --rm \
+                        -v $(pwd)/db-changelog:/liquibase/changelog \
+                        -e LIQUIBASE_URL=${dbConnectionString} \
+                        -e LIQUIBASE_USERNAME=${dbUser} \
+                        -e LIQUIBASE_PASSWORD=${dbPassword} \
+                        ${LIQUIBASE_IMAGE} update
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Database schema changes applied successfully."
+        }
+        failure {
+            echo "Database schema change failed. Initiating rollback."
+            script {
+                sh """
+                docker run --rm \
+                    -v $(pwd)/db-changelog:/liquibase/changelog \
+                    -e LIQUIBASE_URL=${dbConnectionString} \
+                    -e LIQUIBASE_USERNAME=${dbUser} \
+                    -e LIQUIBASE_PASSWORD=${dbPassword} \
+                    ${LIQUIBASE_IMAGE} rollbackCount 1
+                """
+            }
+        }
+    }
+}
